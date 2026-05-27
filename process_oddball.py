@@ -39,6 +39,29 @@ import mne
 import numpy as np
 from mne.preprocessing import ICA
 
+# ── Patch: tolerate extra trailing digits in BrainVision date strings ────────
+# Some amplifiers write date stamps with 1-2 extra digits beyond the
+# "%Y%m%d%H%M%S%f" format MNE expects (20 chars).  Truncate the overflow
+# so loading doesn't crash with "unconverted data remains".
+try:
+    import mne.io.brainvision.brainvision as _bv
+    _orig_str_to_meas_date = _bv._str_to_meas_date
+
+    def _tolerant_str_to_meas_date(date_str):
+        try:
+            return _orig_str_to_meas_date(date_str)
+        except ValueError:
+            for trim in range(1, 4):
+                try:
+                    return _orig_str_to_meas_date(date_str[:-trim])
+                except (ValueError, IndexError):
+                    continue
+            return None
+
+    _bv._str_to_meas_date = _tolerant_str_to_meas_date
+except (ImportError, AttributeError):
+    pass
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 FILTER_L_FREQ = 0.1
@@ -1262,6 +1285,24 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger):
     logger.info(f'Loaded: {len(raw.ch_names)} channels, '
                 f'{raw.info["sfreq"]} Hz, {raw.times[-1]:.1f} s')
 
+    # ── 1b. Early event check (skip non-oddball recordings) ──────────────
+    # Detect missing S 1/S 2 before expensive ICA/filtering.
+    # Recordings with only S 16/17/18 are a different protocol.
+    _events_pre, _annot_pre = mne.events_from_annotations(raw,
+                                                           verbose='WARNING')
+    _eid_pre = build_event_id(_annot_pre, logger)
+    if 'standard' not in _eid_pre or 'deviant' not in _eid_pre:
+        annot_keys = list(_annot_pre.keys())
+        has_other = any(re.search(r'S\s+1[678]', k) for k in annot_keys)
+        if has_other:
+            raise ValueError(
+                f'SKIP: Recording contains S 16/17/18 markers (different '
+                f'protocol, not oddball). Annotations: {annot_keys}')
+        raise ValueError(
+            f'SKIP: No standard (S 1) or deviant (S 2) events found. '
+            f'Annotations: {annot_keys}')
+    logger.info('Early event check passed (standard + deviant events present)')
+
     # ── 2. Prepare channels & montage ────────────────────────────────────
     logger.info('── 2. Prepare channels & montage ──')
     raw, eog_ch = prepare_channels(raw, logger)
@@ -1323,6 +1364,22 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger):
         logger.info(f'Dropped non-EEG channel(s) after ICA: {drop_after_ica}')
 
     # ── 7. Interpolate bad channels ──────────────────────────────────────
+    # First, drop EEG channels whose montage position is (0,0,0) or NaN —
+    # they corrupt the spherical-spline interpolation matrix (common in
+    # 129-channel M_y3 recordings that are missing one cap electrode).
+    eeg_picks_all = mne.pick_types(raw.info, eeg=True, exclude=[])
+    no_pos_chs = []
+    for p in eeg_picks_all:
+        pos = raw.info['chs'][p]['loc'][:3]
+        if np.all(pos == 0) or np.any(np.isnan(pos)):
+            no_pos_chs.append(raw.ch_names[p])
+    if no_pos_chs:
+        logger.warning(f'Dropping {len(no_pos_chs)} EEG channel(s) without '
+                       f'valid montage positions: {no_pos_chs}')
+        raw.info['bads'] = [b for b in raw.info['bads']
+                            if b not in no_pos_chs]
+        raw.drop_channels(no_pos_chs)
+
     if raw.info['bads']:
         n_bads = len(raw.info['bads'])
         n_eeg = len(mne.pick_types(raw.info, eeg=True, exclude=[]))
@@ -1330,8 +1387,18 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger):
         if n_bads <= max_interp:
             logger.info(f'── 7. Interpolating {n_bads} bad channel(s): '
                         f'{raw.info["bads"]} ──')
-            raw.interpolate_bads(reset_bads=True, verbose='WARNING')
-            logger.info('Bad channels interpolated')
+            try:
+                raw.interpolate_bads(reset_bads=True, verbose='WARNING')
+                logger.info('Bad channels interpolated')
+            except (ValueError, np.linalg.LinAlgError) as e:
+                if 'NaN' in str(e) or 'Inf' in str(e) or 'inf' in str(e):
+                    logger.warning(f'Interpolation failed ({e}), '
+                                  f'falling back to dropping bad channels')
+                    bads_to_drop = list(raw.info['bads'])
+                    raw.info['bads'] = []
+                    raw.drop_channels(bads_to_drop)
+                else:
+                    raise
         else:
             logger.warning(f'── 7. Too many bad channels to interpolate '
                            f'({n_bads}/{n_eeg}, max {max_interp}). '
