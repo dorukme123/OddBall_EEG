@@ -1325,10 +1325,18 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger):
     # ── 7. Interpolate bad channels ──────────────────────────────────────
     if raw.info['bads']:
         n_bads = len(raw.info['bads'])
-        logger.info(f'── 7. Interpolating {n_bads} bad channel(s): '
-                    f'{raw.info["bads"]} ──')
-        raw.interpolate_bads(reset_bads=True, verbose='WARNING')
-        logger.info('Bad channels interpolated')
+        n_eeg = len(mne.pick_types(raw.info, eeg=True, exclude=[]))
+        max_interp = int(n_eeg * 0.20)  # cap at 20% of EEG channels
+        if n_bads <= max_interp:
+            logger.info(f'── 7. Interpolating {n_bads} bad channel(s): '
+                        f'{raw.info["bads"]} ──')
+            raw.interpolate_bads(reset_bads=True, verbose='WARNING')
+            logger.info('Bad channels interpolated')
+        else:
+            logger.warning(f'── 7. Too many bad channels to interpolate '
+                           f'({n_bads}/{n_eeg}, max {max_interp}). '
+                           f'Dropping instead: {raw.info["bads"]} ──')
+            raw.drop_channels(raw.info['bads'])
     else:
         logger.info('── 7. No bad channels to interpolate ──')
 
