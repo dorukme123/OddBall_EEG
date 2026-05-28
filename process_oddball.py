@@ -1383,7 +1383,7 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger):
     if raw.info['bads']:
         n_bads = len(raw.info['bads'])
         n_eeg = len(mne.pick_types(raw.info, eeg=True, exclude=[]))
-        max_interp = int(n_eeg * 0.20)  # cap at 20% of EEG channels
+        max_interp = int(n_eeg * 0.40)  # cap at 40% of EEG channels
         if n_bads <= max_interp:
             logger.info(f'── 7. Interpolating {n_bads} bad channel(s): '
                         f'{raw.info["bads"]} ──')
@@ -1449,6 +1449,14 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger):
         n = len(epochs[cond])
         logger.info(f'  {cond}: {n} epochs')
     logger.info(f'  Total: {len(epochs)} epochs')
+
+    # Guard: abort gracefully if a condition has 0 epochs after rejection
+    for cond in ('standard', 'deviant'):
+        if cond in epoch_event_id and len(epochs[cond]) == 0:
+            raise ValueError(
+                f'SKIP: 0 {cond} epochs survived rejection '
+                f'(all exceeded {EPOCH_REJECT["eeg"] * 1e6:.0f} uV '
+                f'threshold). Recording too noisy to process.')
 
     # ── 10. Compute ERPs ─────────────────────────────────────────────────
     logger.info('── 10. Compute evoked responses ──')
